@@ -1,0 +1,393 @@
+# ============================================================================
+# GitHub Copilot Coder - Automated Code Generation Workflow
+# ============================================================================
+# Issue 에 'copilot' 라벨이 추가되면 트리거되어
+# Copilot CLI (@github/copilot) 를 통해 코드를 자동 생성하고
+# PR 을 생성합니다.
+#
+# 사전 요구사항:
+# - GH_TOKEN secret: Classic PAT (repo, workflow 스코프)
+# - COPILOT_TOKEN secret: GitHub Copilot API 접근 토큰
+# ============================================================================
+
+name: 🤖 Copilot Coder
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  copilot-coder:
+    # 'copilot' 라벨이 있을 때만 실행
+    if: contains(github.event.issue.labels.*.name, 'copilot')
+    runs-on: self-hosted
+
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    env:
+      MODEL: claude-haiku-4.5
+      COPILOT_VERSION: "0.0.352"
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      ISSUE_BODY: ${{ github.event.issue.body }}
+      ISSUE_CREATOR: ${{ github.event.issue.user.login }}
+      REPO_NAME: ${{ github.repository }}
+      BRANCH_NAME: copilot/${{ github.event.issue.number }}
+
+    steps:
+      # ---------------------------------------------------------------
+      # Step 1: Workflow 시작 알림
+      # ---------------------------------------------------------------
+      - name: 🚀 Workflow 시작
+        shell: bash
+        run: |
+          echo "🚀 GitHub Copilot Coder 워크플로우 시작!"
+          echo "═══════════════════════════════════════════════════════════"
+          echo "📋 Issue: #${ISSUE_NUMBER}"
+          echo "📌 Title: ${ISSUE_TITLE}"
+          echo "👤 Creator: ${ISSUE_CREATOR}"
+          echo "📦 Repository: ${REPO_NAME}"
+          echo "🌿 Branch: ${BRANCH_NAME}"
+          echo "═══════════════════════════════════════════════════════════"
+
+      # ---------------------------------------------------------------
+      # Step 2: GHES 호스트명 추출 및 Git Credentials 설정
+      # ---------------------------------------------------------------
+      - name: 🔐 Git Credentials 설정
+        shell: bash
+        run: |
+          GHES_HOST=$(echo "${{ github.server_url }}" | sed 's|https://||')
+          echo "GHES_HOST=${GHES_HOST}" >> $GITHUB_ENV
+
+          # GHES self-signed 인증서 대응
+          git config --global http.sslVerify false
+
+          # github.token (GITHUB_TOKEN) 을 git 인증에 사용
+          git config --global credential.helper store
+          rm -f ~/.git-credentials
+          echo "https://x-access-token:${{ github.token }}@${GHES_HOST}" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+          echo "✅ Git credentials 설정 완료 (${GHES_HOST})"
+
+      # ---------------------------------------------------------------
+      # Step 3: Issue 라벨 업데이트 (in-progress)
+      # ---------------------------------------------------------------
+      - name: 🏷️ Issue 라벨 업데이트 (in-progress)
+        shell: bash
+        run: |
+          API_URL="${{ github.server_url }}/api/v3"
+
+          # 'copilot' 라벨 제거
+          curl -s -X DELETE \
+            -H "Authorization: token ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "${API_URL}/repos/${REPO_NAME}/issues/${ISSUE_NUMBER}/labels/copilot" || true
+
+          # 'in-progress' 라벨 추가
+          curl -s -X POST \
+            -H "Authorization: token ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            -d '{"labels":["in-progress"]}' \
+            "${API_URL}/repos/${REPO_NAME}/issues/${ISSUE_NUMBER}/labels"
+
+          # Issue 코멘트 작성
+          COMMENT="## 🤖 Copilot 이 작업을 시작합니다!\n\nIssue 내용을 기반으로 Copilot CLI 가 코드를 생성합니다.\n진행 상황은 [GitHub Actions](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) 에서 확인하세요."
+
+          curl -s -X POST \
+            -H "Authorization: token ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            -d "{\"body\":\"${COMMENT}\"}" \
+            "${API_URL}/repos/${REPO_NAME}/issues/${ISSUE_NUMBER}/comments"
+
+          echo "✅ Issue 라벨 업데이트 및 코멘트 완료!"
+
+      # ---------------------------------------------------------------
+      # Step 4: Repository 체크아웃
+      # ---------------------------------------------------------------
+      - name: 📥 Repository 체크아웃
+        uses: actions/checkout@v3
+        with:
+          token: ${{ github.token }}
+          persist-credentials: false
+
+      # ---------------------------------------------------------------
+      # Step 5: Node.js 설정
+      # ---------------------------------------------------------------
+      - name: ⚙️ Node.js 설정
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22.x'
+
+      # ---------------------------------------------------------------
+      # Step 6: Copilot CLI 설치
+      # ---------------------------------------------------------------
+      - name: 📦 Copilot CLI 설치
+        shell: bash
+        run: |
+          if ! command -v copilot &> /dev/null; then
+            echo "📦 @github/copilot@${COPILOT_VERSION} 설치 중..."
+            npm install -g @github/copilot@${COPILOT_VERSION}
+          else
+            echo "✅ @github/copilot 이미 설치됨"
+            copilot --version
+          fi
+
+      # ---------------------------------------------------------------
+      # Step 7: 작업 브랜치 생성
+      # ---------------------------------------------------------------
+      - name: 🌿 작업 브랜치 생성
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 리모트에 기존 브랜치가 있는지 확인 (SSL 무시)
+          git -c http.sslVerify=false fetch origin "${BRANCH_NAME}" 2>/dev/null && BRANCH_EXISTS=true || BRANCH_EXISTS=false
+
+          if [ "$BRANCH_EXISTS" = "true" ]; then
+            echo "🔄 기존 브랜치 '${BRANCH_NAME}' 발견. 체크아웃합니다."
+            git checkout -b "${BRANCH_NAME}" "origin/${BRANCH_NAME}"
+          else
+            echo "🌿 새 브랜치 '${BRANCH_NAME}' 생성"
+            git checkout -b "${BRANCH_NAME}"
+          fi
+
+          echo "✅ 브랜치 '${BRANCH_NAME}' 준비 완료"
+
+      # ---------------------------------------------------------------
+      # Step 8: Copilot CLI 로 코드 생성
+      # ---------------------------------------------------------------
+      - name: 🤖 Copilot CLI 로 코드 생성
+        shell: bash
+        timeout-minutes: 30
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "🤖 GitHub Copilot CLI 실행 중..."
+          echo "═══════════════════════════════════════════════════════════"
+          echo "📋 Issue: #${ISSUE_NUMBER}"
+          echo "📌 Title: ${ISSUE_TITLE}"
+          echo "═══════════════════════════════════════════════════════════"
+
+          # Issue 내용을 파일로 저장 (인젝션 방지)
+          printf '%s' "${ISSUE_BODY}" > /tmp/issue_description.txt
+
+          # Copilot CLI 실행 (non-interactive 모드)
+          # -p: 프롬프트 전달 (비대화형)
+          # --add-dir: 워크스페이스 디렉토리 컨텍스트 제공
+          # --allow-all-tools: 모든 도구 허용
+          copilot -p "Implement the GitHub issue following the description details: $(cat /tmp/issue_description.txt)" \
+            --add-dir "$(pwd)" \
+            --allow-all-tools \
+            --model "${MODEL}"
+
+          # 임시 파일 정리
+          rm -f /tmp/issue_description.txt
+
+          echo "✅ Copilot CLI 코드 생성 완료!"
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_TOKEN }}
+
+      # ---------------------------------------------------------------
+      # Step 9: 변경사항 커밋
+      # ---------------------------------------------------------------
+      - name: 💾 변경사항 커밋
+        id: commit
+        shell: bash
+        run: |
+          echo "📝 커밋 준비 중..."
+
+          # Co-author 정보
+          CREATOR_NAME="${ISSUE_CREATOR}"
+          CREATOR_EMAIL="${ISSUE_CREATOR}@users.noreply.github.com"
+
+          git add .
+
+          # Copilot 이 생성한 메타 파일 제외
+          for file in copilot-summary.md commit-message.md .final-commit-msg.txt; do
+            if git ls-files --cached "$file" > /dev/null 2>&1; then
+              git reset HEAD "$file" 2>/dev/null || true
+            fi
+          done
+
+          # 변경사항 확인
+          if git diff --cached --quiet; then
+            echo "⚠️ 변경사항이 없습니다. 이후 스텝을 건너뜁니다."
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+
+          # 커밋 메시지: Copilot 이 생성한 것이 있으면 사용, 없으면 기본값
+          if [ -f "commit-message.md" ]; then
+            echo "✅ Copilot 이 생성한 커밋 메시지 사용"
+            {
+              cat commit-message.md
+              echo ""
+              echo ""
+              echo "Co-authored-by: ${CREATOR_NAME} <${CREATOR_EMAIL}>"
+            } > .final-commit-msg.txt
+          else
+            {
+              echo "feat: Issue #${ISSUE_NUMBER} - ${ISSUE_TITLE}"
+              echo ""
+              echo "Copilot CLI 가 자동 생성한 코드입니다."
+              echo ""
+              echo "Co-authored-by: ${CREATOR_NAME} <${CREATOR_EMAIL}>"
+            } > .final-commit-msg.txt
+          fi
+
+          git commit -F .final-commit-msg.txt
+          rm -f .final-commit-msg.txt
+
+          echo "✅ 커밋 완료!"
+
+      # ---------------------------------------------------------------
+      # Step 10: 브랜치 푸시
+      # ---------------------------------------------------------------
+      - name: 🚀 브랜치 푸시
+        if: steps.commit.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          # Copilot CLI 가 오염시켰을 수 있는 git 설정 초기화
+          git config --local --unset-all "http.https://aibghes.koreacentral.cloudapp.azure.com/.extraheader" 2>/dev/null || true
+          git config --global --unset-all credential.helper 2>/dev/null || true
+
+          # github.token (GITHUB_TOKEN) 으로 push
+          GHES_HOST=$(echo "${{ github.server_url }}" | sed 's|https://||')
+          git remote set-url origin "https://x-access-token:${{ github.token }}@${GHES_HOST}/${REPO_NAME}"
+
+          git -c credential.helper= -c http.sslVerify=false push -u origin "${BRANCH_NAME}" --force
+          echo "✅ 브랜치 '${BRANCH_NAME}' 푸시 완료!"
+
+      # ---------------------------------------------------------------
+      # Step 11: 기존 PR 확인
+      # ---------------------------------------------------------------
+      - name: 🔍 기존 PR 확인
+        id: check-pr
+        shell: bash
+        run: |
+          API_URL="${{ github.server_url }}/api/v3"
+
+          EXISTING_PR=$(curl -s \
+            -H "Authorization: token ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "${API_URL}/repos/${REPO_NAME}/pulls?head=${REPO_NAME%%/*}:${BRANCH_NAME}&state=open" \
+            | jq '.[0].html_url // empty')
+
+          if [ -n "$EXISTING_PR" ]; then
+            PR_URL=$(echo "$EXISTING_PR" | tr -d '"')
+            PR_NUMBER=$(echo "$PR_URL" | grep -o '[0-9]*$')
+            echo "🔄 기존 PR 발견: ${PR_URL}"
+            echo "pr_exists=true" >> $GITHUB_OUTPUT
+            echo "PR_URL=${PR_URL}" >> $GITHUB_ENV
+            echo "PR_NUMBER=${PR_NUMBER}" >> $GITHUB_ENV
+          else
+            echo "🆕 기존 PR 없음"
+            echo "pr_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ---------------------------------------------------------------
+      # Step 12: Pull Request 생성 (새 변경사항이 있고 기존 PR 이 없을 때만)
+      # ---------------------------------------------------------------
+      - name: 🔀 Pull Request 생성
+        if: steps.commit.outputs.has_changes == 'true' && steps.check-pr.outputs.pr_exists == 'false'
+        shell: bash
+        run: |
+          API_URL="${{ github.server_url }}/api/v3"
+
+          # Copilot 이 생성한 요약이 있으면 PR 본문에 포함
+          if [ -f "copilot-summary.md" ]; then
+            PR_BODY_CONTENT=$(cat copilot-summary.md)
+          else
+            PR_BODY_CONTENT="Copilot CLI 가 자동 생성한 코드입니다."
+          fi
+
+          # PR 본문을 파일로 저장 (인젝션 방지)
+          {
+            echo "## 🤖 Copilot 이 자동 생성한 PR"
+            echo ""
+            echo "${PR_BODY_CONTENT}"
+            echo ""
+            echo "### 📋 관련 Issue"
+            echo "- Closes #${ISSUE_NUMBER}"
+            echo ""
+            echo "### ⚠️ 리뷰 안내"
+            echo "이 PR 은 AI 가 자동 생성한 코드이므로 반드시 사람이 리뷰한 후 머지해 주세요."
+          } > /tmp/pr_body.txt
+
+          PR_BODY=$(cat /tmp/pr_body.txt)
+
+          # PR 생성 API 호출
+          PR_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -H "Authorization: token ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            -d "$(jq -n \
+              --arg title "🤖 [Copilot] Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}" \
+              --arg body "$PR_BODY" \
+              --arg head "${BRANCH_NAME}" \
+              --arg base "main" \
+              '{title: $title, body: $body, head: $head, base: $base}')" \
+            "${API_URL}/repos/${REPO_NAME}/pulls")
+
+          rm -f /tmp/pr_body.txt
+
+          HTTP_CODE=$(echo "${PR_RESPONSE}" | tail -1)
+          BODY=$(echo "${PR_RESPONSE}" | sed '$d')
+
+          if [ "${HTTP_CODE}" != "201" ]; then
+            echo "❌ PR 생성 실패 (HTTP ${HTTP_CODE})"
+            echo "${BODY}"
+            exit 1
+          fi
+
+          PR_URL=$(echo "${BODY}" | jq -r '.html_url')
+          PR_NUMBER=$(echo "${BODY}" | jq -r '.number')
+
+          echo "✅ PR #${PR_NUMBER} 생성 완료: ${PR_URL}"
+          echo "PR_URL=${PR_URL}" >> $GITHUB_ENV
+          echo "PR_NUMBER=${PR_NUMBER}" >> $GITHUB_ENV
+
+      # ---------------------------------------------------------------
+      # Step 13: Issue 에 완료 코멘트 및 라벨 업데이트
+      # ---------------------------------------------------------------
+      - name: ✅ 완료 알림
+        if: steps.commit.outputs.has_changes == 'true' || steps.check-pr.outputs.pr_exists == 'true'
+        shell: bash
+        run: |
+          API_URL="${{ github.server_url }}/api/v3"
+
+          # 'in-progress' 라벨 제거 및 'ready-for-review' 라벨 추가
+          curl -s -X DELETE \
+            -H "Authorization: token ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "${API_URL}/repos/${REPO_NAME}/issues/${ISSUE_NUMBER}/labels/in-progress" || true
+
+          curl -s -X POST \
+            -H "Authorization: token ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            -d '{"labels":["ready-for-review"]}' \
+            "${API_URL}/repos/${REPO_NAME}/issues/${ISSUE_NUMBER}/labels"
+
+          # Issue 에 완료 코멘트
+          if [ "${{ steps.commit.outputs.has_changes }}" == "true" ]; then
+            COMMENT="## ✅ Copilot 코드 생성 완료!\n\nPR 이 생성되었습니다: ${PR_URL}\n\n### 👀 다음 단계\n1. Pull Request 리뷰\n2. 구현 테스트\n3. 승인 및 머지\n\n리뷰 후 머지해 주세요. 🙏"
+          else
+            COMMENT="## ℹ️ Copilot 재실행 완료\n\n새로운 변경사항이 없습니다. 기존 PR 을 확인해 주세요: ${PR_URL}"
+          fi
+
+          curl -s -X POST \
+            -H "Authorization: token ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            -d "{\"body\":\"${COMMENT}\"}" \
+            "${API_URL}/repos/${REPO_NAME}/issues/${ISSUE_NUMBER}/comments"
+
+          echo "✅ 모든 작업이 완료되었습니다!"
+          echo "  📋 Issue: #${ISSUE_NUMBER}"
+          echo "  🔀 PR: ${PR_URL}"
+
+
