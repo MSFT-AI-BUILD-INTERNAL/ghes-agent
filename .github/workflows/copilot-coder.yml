@@ -6,8 +6,9 @@
 # PR 을 생성합니다.
 #
 # 사전 요구사항:
-# - GH_TOKEN secret: Classic PAT (repo, workflow 스코프)
-# - COPILOT_TOKEN secret: GitHub Copilot API 접근 토큰
+# - AZURE_AI_PROJECT_ENDPOINT variable: Azure AI Foundry Project Endpoint
+# - AZURE_AI_MODEL_DEPLOYMENT_NAME variable: Azure AI Foundry 모델 배포명
+# - Azure Managed Identity: Foundry/Cognitive Services 호출 권한 필요
 # ============================================================================
 
 name: 🤖 Copilot Coder
@@ -28,8 +29,14 @@ jobs:
       pull-requests: write
 
     env:
-      MODEL: claude-haiku-4.5
-      COPILOT_VERSION: "0.0.352"
+      MODEL: ${{ vars.COPILOT_MODEL || vars.AZURE_AI_MODEL_DEPLOYMENT_NAME || 'claude-haiku-4.5' }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_AI_PROJECT_ENDPOINT: ${{ vars.AZURE_AI_PROJECT_ENDPOINT }}
+      AZURE_AI_MODEL_DEPLOYMENT_NAME: ${{ vars.AZURE_AI_MODEL_DEPLOYMENT_NAME }}
+      AZURE_OPENAI_API_VERSION: ${{ vars.AZURE_OPENAI_API_VERSION }}
+      FOUNDRY_AUTH_MODE: ${{ vars.FOUNDRY_AUTH_MODE || 'azure_identity' }}
+      FOUNDRY_WIRE_API: ${{ vars.FOUNDRY_WIRE_API || 'responses' }}
+      FOUNDRY_SKIP_TLS_VERIFY: ${{ vars.FOUNDRY_SKIP_TLS_VERIFY || 'false' }}
       ISSUE_NUMBER: ${{ github.event.issue.number }}
       ISSUE_TITLE: ${{ github.event.issue.title }}
       ISSUE_BODY: ${{ github.event.issue.body }}
@@ -114,25 +121,36 @@ jobs:
           persist-credentials: false
 
       # ---------------------------------------------------------------
-      # Step 5: Node.js 설정
+      # Step 5: Node.js 확인
       # ---------------------------------------------------------------
-      - name: ⚙️ Node.js 설정
-        uses: actions/setup-node@v3
-        with:
-          node-version: '22.x'
+      - name: ⚙️ Node.js 확인
+        shell: bash
+        run: |
+          if ! command -v node >/dev/null 2>&1; then
+            echo "❌ 폐쇄망 환경에서는 Runner 에 Node.js 를 사전 설치해야 합니다."
+            exit 1
+          fi
+
+          echo "✅ Node.js: $(node --version)"
 
       # ---------------------------------------------------------------
-      # Step 6: Copilot CLI 설치
+      # Step 6: Copilot CLI 확인
       # ---------------------------------------------------------------
-      - name: 📦 Copilot CLI 설치
+      - name: 📦 Copilot CLI 확인
         shell: bash
         run: |
           if ! command -v copilot &> /dev/null; then
-            echo "📦 @github/copilot@${COPILOT_VERSION} 설치 중..."
-            npm install -g @github/copilot@${COPILOT_VERSION}
-          else
-            echo "✅ @github/copilot 이미 설치됨"
-            copilot --version
+            echo "❌ 폐쇄망 환경에서는 Runner 에 Copilot CLI 를 사전 설치해야 합니다."
+            exit 1
+          fi
+
+          echo "✅ @github/copilot 설치 확인"
+          copilot --version
+
+          if ! copilot help environment | grep -q "COPILOT_OFFLINE"; then
+            echo "❌ 설치된 Copilot CLI 가 COPILOT_OFFLINE/BYOK provider 환경변수를 지원하지 않습니다."
+            echo "   BYOK 및 offline mode 를 지원하는 최신 Copilot CLI 로 Runner 를 업데이트하세요."
+            exit 1
           fi
 
       # ---------------------------------------------------------------
@@ -174,6 +192,58 @@ jobs:
           # Issue 내용을 파일로 저장 (인젝션 방지)
           printf '%s' "${ISSUE_BODY}" > /tmp/issue_description.txt
 
+          if [ -z "${AZURE_AI_PROJECT_ENDPOINT}" ]; then
+            echo "❌ AZURE_AI_PROJECT_ENDPOINT repository variable 이 설정되지 않았습니다."
+            exit 1
+          fi
+
+          if [ -z "${AZURE_AI_MODEL_DEPLOYMENT_NAME}" ]; then
+            echo "❌ AZURE_AI_MODEL_DEPLOYMENT_NAME repository variable 이 설정되지 않았습니다."
+            exit 1
+          fi
+
+          if [ "${FOUNDRY_AUTH_MODE}" != "azure_identity" ]; then
+            echo "❌ 이 워크플로는 API Key 없이 Azure Managed Identity 만 사용합니다. FOUNDRY_AUTH_MODE=azure_identity 로 설정하세요."
+            exit 1
+          fi
+
+          if [ "${FOUNDRY_SKIP_TLS_VERIFY}" = "true" ]; then
+            echo "⚠️ FOUNDRY_SKIP_TLS_VERIFY=true: 내부 인증서 검증을 비활성화합니다."
+            export NODE_TLS_REJECT_UNAUTHORIZED=0
+          fi
+
+          IMDS_TOKEN_URL="http://169.254.169.254/metadata/identity/oauth2/token"
+          IMDS_API_VERSION="2018-02-01"
+          IMDS_RESOURCE="https://cognitiveservices.azure.com/"
+
+          if [ -n "${AZURE_CLIENT_ID}" ]; then
+            TOKEN_RESPONSE=$(curl -sS --fail --connect-timeout 2 --max-time 10 \
+              -H "Metadata: true" \
+              "${IMDS_TOKEN_URL}?api-version=${IMDS_API_VERSION}&resource=${IMDS_RESOURCE}&client_id=${AZURE_CLIENT_ID}") || {
+                echo "❌ User-assigned Managed Identity 토큰 발급에 실패했습니다. AZURE_CLIENT_ID 와 VM Identity 연결 상태를 확인하세요."
+                exit 1
+              }
+          else
+            TOKEN_RESPONSE=$(curl -sS --fail --connect-timeout 2 --max-time 10 \
+              -H "Metadata: true" \
+              "${IMDS_TOKEN_URL}?api-version=${IMDS_API_VERSION}&resource=${IMDS_RESOURCE}") || {
+                echo "❌ System-assigned Managed Identity 토큰 발급에 실패했습니다. Runner VM 에 Managed Identity 가 부착되어 있는지 확인하세요."
+                exit 1
+              }
+          fi
+
+          FOUNDRY_ACCESS_TOKEN=$(echo "${TOKEN_RESPONSE}" | jq -r '.access_token // empty')
+
+          if [ -z "${FOUNDRY_ACCESS_TOKEN}" ]; then
+            echo "❌ Azure Managed Identity 로 Foundry access token 을 발급하지 못했습니다."
+            exit 1
+          fi
+
+          export COPILOT_PROVIDER_BEARER_TOKEN="${FOUNDRY_ACCESS_TOKEN}"
+
+          echo "🔐 Azure AI Foundry endpoint: ${AZURE_AI_PROJECT_ENDPOINT}"
+          echo "🤖 Azure AI Foundry deployment: ${AZURE_AI_MODEL_DEPLOYMENT_NAME}"
+
           # Copilot CLI 실행 (non-interactive 모드)
           # -p: 프롬프트 전달 (비대화형)
           # --add-dir: 워크스페이스 디렉토리 컨텍스트 제공
@@ -181,14 +251,21 @@ jobs:
           copilot -p "Implement the GitHub issue following the description details: $(cat /tmp/issue_description.txt)" \
             --add-dir "$(pwd)" \
             --allow-all-tools \
-            --model "${MODEL}"
+            --model "${MODEL}" \
+            --disable-builtin-mcps
 
           # 임시 파일 정리
           rm -f /tmp/issue_description.txt
 
           echo "✅ Copilot CLI 코드 생성 완료!"
         env:
-          GH_TOKEN: ${{ secrets.COPILOT_TOKEN }}
+          COPILOT_OFFLINE: "true"
+          COPILOT_PROVIDER_BASE_URL: ${{ vars.AZURE_AI_PROJECT_ENDPOINT }}
+          COPILOT_PROVIDER_TYPE: "azure"
+          COPILOT_PROVIDER_WIRE_API: ${{ vars.FOUNDRY_WIRE_API || 'responses' }}
+          COPILOT_PROVIDER_AZURE_API_VERSION: ${{ vars.AZURE_OPENAI_API_VERSION }}
+          COPILOT_PROVIDER_MODEL_ID: ${{ vars.COPILOT_MODEL || vars.AZURE_AI_MODEL_DEPLOYMENT_NAME }}
+          COPILOT_PROVIDER_WIRE_MODEL: ${{ vars.AZURE_AI_MODEL_DEPLOYMENT_NAME }}
 
       # ---------------------------------------------------------------
       # Step 9: 변경사항 커밋
@@ -389,5 +466,3 @@ jobs:
           echo "✅ 모든 작업이 완료되었습니다!"
           echo "  📋 Issue: #${ISSUE_NUMBER}"
           echo "  🔀 PR: ${PR_URL}"
-
-
