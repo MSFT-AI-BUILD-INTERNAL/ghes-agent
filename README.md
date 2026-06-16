@@ -172,6 +172,85 @@ env:
 
 ---
 
+## 🔒 폐쇄망 환경에서 사용하기 (BYOK)
+
+GitHub Copilot CLI 의 **BYOK (Bring Your Own Key)** 기능을 활용하면, 외부 인터넷 연결 없이 **폐쇄망(Air-Gapped) 환경**에서도 Copilot CLI 를 사용할 수 있습니다.
+
+### BYOK 란?
+
+BYOK 는 GitHub Copilot 의 기본 백엔드 대신, 사용자가 직접 제공하는 LLM API 엔드포인트와 키를 사용하도록 설정하는 기능입니다. 이를 통해:
+
+- 폐쇄망 내부에 배포된 **자체 LLM 서버** (예: Azure OpenAI, vLLM, Ollama 등) 를 활용할 수 있습니다.
+- 외부 네트워크 연결 없이도 코드 생성, 리뷰, 테스트 등 Copilot CLI 의 모든 기능을 사용할 수 있습니다.
+- 민감한 코드가 외부로 전송되지 않으므로 **보안 규정이 엄격한 환경**에 적합합니다.
+
+### 폐쇄망 구성 방법
+
+#### 1. 내부 LLM 서버 준비
+
+폐쇄망 내부에 OpenAI API 호환 엔드포인트를 제공하는 LLM 서버를 배포합니다:
+
+| 솔루션 | 설명 |
+|--------|------|
+| Azure OpenAI (Private Endpoint) | Azure 전용 네트워크 내 GPT 모델 |
+| vLLM | 오픈소스 고성능 LLM 서빙 엔진 |
+| Ollama | 로컬 LLM 실행 도구 |
+| Text Generation Inference (TGI) | HuggingFace 의 LLM 서빙 프레임워크 |
+
+#### 2. 환경 변수 설정
+
+Copilot CLI 가 내부 LLM 서버를 사용하도록 환경 변수를 설정합니다:
+
+```bash
+# LLM API 엔드포인트 (폐쇄망 내부 주소)
+export COPILOT_LLM_BASE_URL="https://internal-llm.corp.example.com/v1"
+
+# API 인증 키
+export COPILOT_LLM_API_KEY="your-internal-api-key"
+```
+
+#### 3. 워크플로에 BYOK 설정 적용
+
+`.github/workflows/copilot-coder.yml` 에서 환경 변수를 추가합니다:
+
+```yaml
+env:
+  MODEL: gpt-4o                    # 내부 LLM 서버에서 제공하는 모델명
+  COPILOT_LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+  COPILOT_LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+```
+
+#### 4. Secrets 등록
+
+Repository → **Settings → Secrets and variables → Actions** 에 추가합니다:
+
+| Secret | 설명 |
+|--------|------|
+| `LLM_BASE_URL` | 내부 LLM 서버의 API 엔드포인트 URL |
+| `LLM_API_KEY` | 내부 LLM 서버 인증 키 |
+
+### 폐쇄망 네트워크 요구사항
+
+BYOK 를 사용하면 외부 인터넷 접근 요구사항이 크게 줄어듭니다:
+
+| 도메인 | 용도 | 필수 여부 |
+|--------|------|-----------|
+| `<GHES 호스트>` | Git 작업 및 API 호출 | ✅ 필수 |
+| `<내부 LLM 서버>` | AI 코드 생성 요청 | ✅ 필수 |
+| `registry.npmjs.org` | Copilot CLI 패키지 다운로드 | ⚠️ 초기 설치 시만 필요 |
+
+> 💡 **Tip**: `registry.npmjs.org` 접근이 불가한 경우, npm 패키지를 사전에 다운로드하여 내부 npm registry (Verdaccio, Nexus 등) 에 미러링하거나, Runner 에 사전 설치된 상태로 구성할 수 있습니다.
+
+### 폐쇄망 환경 체크리스트
+
+- [ ] 내부 LLM 서버가 OpenAI API 호환 엔드포인트를 제공하는지 확인
+- [ ] Runner VM 에서 내부 LLM 서버로의 네트워크 접근 가능 여부 확인
+- [ ] `@github/copilot` npm 패키지가 Runner 에 설치 가능한지 확인 (내부 registry 또는 사전 설치)
+- [ ] GHES 호스트와 Runner 간 통신 정상 여부 확인
+- [ ] Secrets (`LLM_BASE_URL`, `LLM_API_KEY`) 등록 완료
+
+---
+
 ## 🏗️ 응용: 플랫폼화 (Reusable Workflow)
 
 현재 `copilot-coder.yml` 은 단일 리포지토리에서 동작하지만, **Reusable Workflow** 로 전환하면 Organization 내 여러 리포지토리에서 공통으로 사용할 수 있습니다.
